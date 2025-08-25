@@ -29,6 +29,7 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 from gym_pybullet_drones.utils.Logger import Logger
 from gym_pybullet_drones.envs.HoverAviary import HoverAviary
+from gym_pybullet_drones.envs.VisionAviary import VisionAviary
 from gym_pybullet_drones.envs.MultiHoverAviary import MultiHoverAviary
 from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
@@ -39,7 +40,7 @@ DEFAULT_OUTPUT_FOLDER = 'results'
 DEFAULT_COLAB = False
 
 DEFAULT_OBS = ObservationType('kin') # 'kin' or 'rgb'
-DEFAULT_ACT = ActionType('one_d_rpm') # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
+DEFAULT_ACT = ActionType('pid') # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
 DEFAULT_AGENTS = 2
 DEFAULT_MA = False
 
@@ -50,12 +51,11 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
         os.makedirs(filename+'/')
 
     if not multiagent:
-        train_env = make_vec_env(HoverAviary,
+        train_env = make_vec_env(VisionAviary, 
                                  env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT),
-                                 n_envs=1,
-                                 seed=0
+                                 n_envs=1
                                  )
-        eval_env = HoverAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT)
+        eval_env = VisionAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT)
     else:
         train_env = make_vec_env(MultiHoverAviary,
                                  env_kwargs=dict(num_drones=DEFAULT_AGENTS, obs=DEFAULT_OBS, act=DEFAULT_ACT),
@@ -121,11 +121,11 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
 
     #### Show (and record a video of) the model's performance ##
     if not multiagent: 
-        test_env = HoverAviary(gui=gui,
+        test_env = VisionAviary(gui=gui,
                                obs=DEFAULT_OBS,
                                act=DEFAULT_ACT,
                                record=record_video)
-        test_env_nogui = HoverAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT)
+        test_env_nogui = VisionAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT)
     else:
         test_env = MultiHoverAviary(gui=gui,
                                         num_drones=DEFAULT_AGENTS,
