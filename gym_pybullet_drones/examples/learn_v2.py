@@ -14,6 +14,7 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
+from gym_pybullet_drones.envs.HoverAviary import HoverAviary
 from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 tmp = VisionAviary(obs=ObservationType('rgb'), act=ActionType('pid'), ctrl_freq=24, gui=False)
@@ -35,8 +36,14 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
 
     # ---- envs ----
     train_env = make_vec_env(
-        VisionAviary,
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24),
+        HoverAviary,
+        env_kwargs=dict(
+            obs=DEFAULT_OBS,
+            act=DEFAULT_ACT,
+            ctrl_freq=24,
+            gui=True                 # if you want the PyBullet window
+            # render_mode="human"       # or "rgb_array" if you only need frames
+        ),
         n_envs=1
     )
     eval_env = VisionAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, gui=False)
