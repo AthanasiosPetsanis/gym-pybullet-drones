@@ -7,35 +7,64 @@ import os, time
 from datetime import datetime
 import argparse
 import numpy as np
+import os, numpy as np, matplotlib.pyplot as plt
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.vec_env import VecFrameStack
 
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
 from gym_pybullet_drones.envs.HoverAviary import HoverAviary
 from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
-tmp = VisionAviary(obs=ObservationType('rgb'), act=ActionType('pid'), ctrl_freq=24, gui=False)
-print("OBS SPACE:", tmp.observation_space, tmp.observation_space.dtype)
-obs, _ = tmp.reset()
-print("OBS SHAPE/DTYPE:", getattr(obs, "shape", None), getattr(obs, "dtype", None))
-tmp.close()
+
 DEFAULT_GUI = True
 DEFAULT_RECORD_VIDEO = False
 DEFAULT_OUTPUT_FOLDER = 'results'
-DEFAULT_OBS = ObservationType('rgb')     # image obs
+DEFAULT_OBS = ObservationType('kin')     # image obs
 DEFAULT_ACT = ActionType('pid')          # 3D setpoint -> PID -> RPMs
 DEFAULT_MA  = False
+DIFFICULTY = 0  # 0: easy, 1: medium, 2: hard
 
-def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_GUI, plot=False, colab=False, record_video=DEFAULT_RECORD_VIDEO, local=True):
+def plot_evals(run_dir, show=True, save=True, title_suffix=""):
+    import os, numpy as np, matplotlib.pyplot as plt
+    evf = os.path.join(run_dir, "evaluations.npz")
+    if not os.path.isfile(evf):
+        print("[WARN] No evaluations.npz found; nothing to plot."); return
+    E = np.load(evf)
+    t = E["timesteps"]
+    R = E["results"]      # (points, n_eval_eps)
+    L = E["ep_lengths"]   # (points, n_eval_eps)
+    r_mean, r_std = R.mean(axis=1), R.std(axis=1)
+    l_mean = L.mean(axis=1)
+
+    plt.figure()
+    plt.plot(t, r_mean); plt.fill_between(t, r_mean-r_std, r_mean+r_std, alpha=0.2)
+    plt.xlabel("timesteps"); plt.ylabel("eval mean reward (±std)")
+    plt.title(f"PPO (KIN) — reward vs timesteps{title_suffix}"); plt.grid(True)
+    if save: plt.savefig(os.path.join(run_dir, "eval_mean_reward.png"), dpi=150)
+
+    plt.figure()
+    plt.plot(t, l_mean)
+    plt.xlabel("timesteps"); plt.ylabel("eval mean episode length")
+    plt.title(f"PPO (KIN) — ep length vs timesteps{title_suffix}"); plt.grid(True)
+    if save: plt.savefig(os.path.join(run_dir, "eval_mean_ep_len.png"), dpi=150)
+
+    if show: plt.show()
+    else: plt.close('all')
+
+def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_GUI,
+        plot=True, colab=False, record_video=DEFAULT_RECORD_VIDEO, local=True,
+        save_plots=True, eval_episodes=10, demo_seconds=8.0):
     # ---- paths ----
     run_dir = os.path.join(output_folder, 'save-'+datetime.now().strftime("%m.%d.%Y_%H.%M.%S"))
     os.makedirs(run_dir, exist_ok=True)
 
-    # ---- envs ----
+    # --- TRAIN ENV ---
     train_env = make_vec_env(
+<<<<<<< HEAD
         HoverAviary,
         env_kwargs=dict(
             obs=DEFAULT_OBS,
@@ -44,10 +73,24 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
             gui=True                 # if you want the PyBullet window
             # render_mode="human"       # or "rgb_array" if you only need frames
         ),
+=======
+        VisionAviary,
+        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY),
+>>>>>>> 5a44e19 (12/9_changes)
         n_envs=1
     )
-    eval_env = VisionAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, gui=False)
+    train_env = VecFrameStack(train_env, n_stack=4, channels_order='first')
 
+    # --- EVAL ENV ---
+    eval_env = make_vec_env(
+        VisionAviary,
+        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY),
+        n_envs=1
+    )
+    eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='first')
+
+
+    #### Check the environment's spaces ########################
     print('[INFO] Action space:', train_env.action_space)
     print('[INFO] Observation space:', train_env.observation_space)
 
@@ -57,21 +100,29 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
         best_model_save_path=run_dir + '/',
         log_path=run_dir + '/',
         eval_freq=10000,
-        n_eval_episodes=5,
-        deterministic=True
+        n_eval_episodes=eval_episodes,
+        deterministic=True,
+        callback_on_new_best=None
     )
 
     # ---- model ----
     model = PPO(
-        "MlpPolicy",            # <-- change from CnnPolicy
-        train_env,
-        device="cpu",           # MLP runs better on CPU
-        verbose=1
+        "MlpPolicy", train_env,
+        learning_rate=2e-4,     # a touch higher
+        n_steps=4096,
+        batch_size=256,
+        gamma=0.99, gae_lambda=0.95,
+        clip_range=0.2,         # a bit wider than 0.15
+        ent_coef=0.007,         # small exploration
+        max_grad_norm=0.5,
+        clip_range_vf=0.2,
+        verbose=1, device="cpu",
+        policy_kwargs=dict(net_arch=[dict(pi=[128,128], vf=[128,128])])
     )
 
     # ---- train ----
     try:
-        model.learn(total_timesteps=int(3e5), callback=eval_callback)
+        model.learn(total_timesteps=int(1e6), callback=eval_callback)
     except KeyboardInterrupt:
         model.save(run_dir + '/interrupt_model')
         print('Saved:', run_dir + '/interrupt_model.zip')
@@ -80,6 +131,19 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
     model.save(run_dir + '/final_model.zip')
     print('Saved run to:', run_dir)
 
+    # ---- plots ----
+    plot_evals(run_dir, show=plot, save=save_plots, title_suffix=f" (diff={DIFFICULTY})")
+
+    if gui and demo_seconds > 0:
+        obs, _ = test_env.reset()
+        import time
+        start_demo = time.time()
+        while time.time() - start_demo < demo_seconds:
+            pos = test_env._getDroneStateVector(0)[0:3]
+            action = pos[None, :].astype(np.float32)  # PID setpoint (1,3)
+            obs, _, _, _, _ = test_env.step(action)
+            test_env.render()
+            sync(test_env.step_counter, start_demo, test_env.CTRL_TIMESTEP)
     # ---- quick numeric summary ----
     if os.path.isfile(run_dir + '/evaluations.npz'):
         with np.load(run_dir + '/evaluations.npz') as data:
@@ -110,5 +174,9 @@ if __name__ == '__main__':
     parser.add_argument('--record_video', default=DEFAULT_RECORD_VIDEO, type=str2bool)
     parser.add_argument('--output_folder', default=DEFAULT_OUTPUT_FOLDER, type=str)
     parser.add_argument('--colab', default=False, type=bool)
+    parser.add_argument('--plot', type=bool, default=True)          # show plots in a window
+    parser.add_argument('--save_plots', type=bool, default=True)    # also save PNGs
+    parser.add_argument('--eval_episodes', type=int, default=10)    # per evaluation
+    parser.add_argument('--demo_seconds', type=float, default=8.0)
     ARGS = parser.parse_args()
     run(**vars(ARGS))
