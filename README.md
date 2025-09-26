@@ -6,6 +6,11 @@ This is a minimalist refactoring of the original `gym-pybullet-drones` repositor
 
 <img src="gym_pybullet_drones/assets/helix.gif" alt="formation flight" width="325"> <img src="gym_pybullet_drones/assets/helix.png" alt="control info" width="425">
 
+> [!TIP]
+> If you are looking for **symbolic dynamics**, check out [`safe-control-gym`](https://github.com/utiasDSL/safe-control-gym) instead
+>
+> If you are looking for **PX4/ArduPilot** support, check out [`aerial-autonomy-stack`](https://github.com/JacopoPan/aerial-autonomy-stack) instead
+
 ## Installation
 
 Tested on Intel x64/Ubuntu 22.04 and Apple Silicon/macOS 14.1.
@@ -45,6 +50,7 @@ python3 downwash.py
 cd gym_pybullet_drones/examples/
 python learn.py # task: single drone hover at z == 1.0
 python learn.py --multiagent true # task: 2-drone hover at z == 1.2 and 0.7
+LATEST_MODEL=$(ls -t results | head -n 1) && python play.py --model_path "results/${LATEST_MODEL}/best_model.zip" # play and visualize the most recent learned policy after training
 ```
 
 <img src="gym_pybullet_drones/assets/rl.gif" alt="rl example" width="375"> <img src="gym_pybullet_drones/assets/marl.gif" alt="marl example" width="375">
