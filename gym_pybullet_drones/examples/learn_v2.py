@@ -9,11 +9,12 @@ import argparse
 import numpy as np
 import os, numpy as np, matplotlib.pyplot as plt
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecFrameStack
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
 from gym_pybullet_drones.envs.HoverAviary import HoverAviary
@@ -65,6 +66,7 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
     # --- TRAIN ENV ---
     train_env = make_vec_env(
 <<<<<<< HEAD
+<<<<<<< HEAD
         HoverAviary,
         env_kwargs=dict(
             obs=DEFAULT_OBS,
@@ -77,6 +79,12 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
         VisionAviary,
         env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY),
 >>>>>>> 5a44e19 (12/9_changes)
+=======
+        VisionAviary,
+        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
+                        random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2, 
+                        start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True),
+>>>>>>> e7ec52b (changes_20/10)
         n_envs=1
     )
     train_env = VecFrameStack(train_env, n_stack=4, channels_order='first')
@@ -84,7 +92,9 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
     # --- EVAL ENV ---
     eval_env = make_vec_env(
         VisionAviary,
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY),
+        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
+                        random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2, 
+                        start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True),
         n_envs=1
     )
     eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='first')
@@ -106,18 +116,21 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
     )
 
     # ---- model ----
-    model = PPO(
+    
+    model = SAC(
         "MlpPolicy", train_env,
-        learning_rate=2e-4,     # a touch higher
-        n_steps=4096,
+        device="cpu",
+        learning_rate=2e-4,       # modest LR
+        buffer_size=200_000,      # big enough, not huge
         batch_size=256,
-        gamma=0.99, gae_lambda=0.95,
-        clip_range=0.2,         # a bit wider than 0.15
-        ent_coef=0.007,         # small exploration
-        max_grad_norm=0.5,
-        clip_range_vf=0.2,
-        verbose=1, device="cpu",
-        policy_kwargs=dict(net_arch=[dict(pi=[128,128], vf=[128,128])])
+        gamma=0.99,
+        tau=0.005,
+        train_freq=1,             # 1 gradient step per env step
+        gradient_steps=1,         # keep it light/fast
+        learning_starts=1_000,    # start learning quickly
+        ent_coef="auto",          # automatic entropy tuning
+        target_update_interval=1,
+        policy_kwargs=dict(net_arch=[256, 256])  # small, fast MLP
     )
 
     # ---- train ----
@@ -151,7 +164,8 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
 
     # ---- visual eval (loads best_model.zip if present) ----
     model_path = run_dir + '/best_model.zip' if os.path.isfile(run_dir + '/best_model.zip') else run_dir + '/final_model.zip'
-    model = PPO.load(model_path, device="cpu")
+    AlgoClass = type(model)                 # reuse the class you just trained (PPO/SAC/DDPG/...)
+    model = AlgoClass.load(model_path, device="cpu")
 
     test_env = VisionAviary(gui=gui, obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, record=record_video)
     obs, info = test_env.reset(seed=42)
