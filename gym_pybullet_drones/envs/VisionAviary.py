@@ -27,21 +27,28 @@ class VisionAviary(BaseRLAviary):
         pyb_freq: int = 240,
         ctrl_freq: int = 24,
     ):
+        # difficulty / obstacles
         self.difficulty = int(difficulty)
-        self._obstacles_enabled = obstacles
+        self._obstacles_enabled = bool(obstacles)
         self._obstacle_ids = []      # track bodies we spawn
         self._goal_id = None
-<<<<<<< HEAD
+        self._obstacle_specs = []    # record primitives for export
+
+        # safety / ceiling
         self.z_max = 1.4           # hard ceiling height (m)
         self.use_ceiling = True    # turn the invisible ceiling on/off
+        self.ceiling_margin = float(ceiling_margin)
+
+        # success / HOLD
         self.success_thresh = 0.4     # meters
         self.hold_steps_req = 10       # must stay inside for this many steps to count success
         self._hold_count = 0
+
+        # reward weights
         self.progress_w     = 15.0          # weight for progress (prev_dist - dist)
         self.dist_w         = 0.15          # constant pull toward the goal each step
         self.step_cost      = 0.02          # tiny time penalty per step
-        self.success_bonus  = 300.0          # one-time bonus for reaching the goal
-=======
+        self.success_bonus  = 300.0         # one-time bonus for reaching the goal
 
         # spawn/goal controls
         self.random_start = bool(random_start)
@@ -50,23 +57,10 @@ class VisionAviary(BaseRLAviary):
         self.start_z_range = tuple(start_z_range)
         self.keep_goal_z_equal_spawn = bool(keep_goal_z_equal_spawn)
 
-        # safety/room
-        self.ceiling_margin = float(ceiling_margin)
-        self.z_max = 1.4                # invisible ceiling baseline
-        self.use_ceiling = True
-
-        # reward
-        self.success_thresh = 0.4
-        self.progress_w = 15.0
-        self.dist_w = 0.15
-        self.step_cost = 0.02
-        self.success_bonus = 300.0
+        # diagnostic / last action logging
         self._last_policy_action = None
         self._last_pid_target = None
 
-        self._obstacle_specs = []
-        
->>>>>>> bf1eadb (changes 30/10)
         super().__init__(
             drone_model=DroneModel.CF2X,
             num_drones=1,
@@ -203,10 +197,6 @@ class VisionAviary(BaseRLAviary):
             if near_plane and in_circle:
                 self._gates_passed += 1
 
-<<<<<<< HEAD
-        dist = float(np.linalg.norm(self.goal - pos))
-        return {"distance_to_goal": dist, "is_success": dist < self.success_thresh}
-=======
         info = {
             "distance_to_goal": dist,
             "is_success": dist < self.success_thresh,
@@ -225,7 +215,6 @@ class VisionAviary(BaseRLAviary):
     def _build_level_geometry(self, start, goal):
         self.goal = np.array(goal, dtype=np.float32)
         self._addObstacles()
->>>>>>> bf1eadb (changes 30/10)
 
     # ---------- Helpers ----------
     def _getDroneImages(self, drone_id=0, segmentation=False):
@@ -272,6 +261,8 @@ class VisionAviary(BaseRLAviary):
             self._obstacle_ids = []
         if not hasattr(self, "_goal_id"):
             self._goal_id = None
+        if not hasattr(self, "_obstacle_specs"):
+            self._obstacle_specs = []
 
         # ----- cleanup previous
         for bid in list(self._obstacle_ids):
@@ -280,6 +271,7 @@ class VisionAviary(BaseRLAviary):
             except Exception:
                 pass
         self._obstacle_ids.clear()
+        self._obstacle_specs.clear()
 
         if self._goal_id is not None:
             try:
@@ -309,6 +301,12 @@ class VisionAviary(BaseRLAviary):
                 self._obstacle_ids.append(bid)
             return bid
 
+        def _record_box(center, half, rgba):
+            self._obstacle_specs.append({"type":"box", "center":list(center), "half":list(half), "rgba":list(rgba)})
+
+        def _record_cylinder(center, radius, height, rgba):
+            self._obstacle_specs.append({"type":"cylinder", "center":list(center), "radius":float(radius), "height":float(height), "rgba":list(rgba)})
+
         def add_cylinder(x, y, radius=0.30, height=1.6, rgba=(0.85, 0.35, 0.35, 0.95)):
             col = p.createCollisionShape(p.GEOM_CYLINDER, radius=radius, height=height, physicsClientId=CLIENT)
             vis = p.createVisualShape(p.GEOM_CYLINDER, radius=radius, length=height, rgbaColor=rgba, physicsClientId=CLIENT)
@@ -320,6 +318,7 @@ class VisionAviary(BaseRLAviary):
                 baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
                 physicsClientId=CLIENT,
             )
+            _record_cylinder([x, y, float(height/2.0)], radius, height, rgba)
             return _track(bid)
 
         def add_box(color_rgba, center_xyz, half_extents):
@@ -333,6 +332,7 @@ class VisionAviary(BaseRLAviary):
                 baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
                 physicsClientId=CLIENT,
             )
+            _record_box(center_xyz, half_extents, color_rgba)
             return _track(bid)
 
         def add_panel_with_round_hole(
@@ -350,7 +350,7 @@ class VisionAviary(BaseRLAviary):
             W, H = float(room_W), float(room_H)
             T, R, B = float(thickness), float(hole_radius), float(border)
 
-            # μισά μεγέθη για τα 4 τεμάχια
+            # half sizes for the 4 pieces
             side_half_y = max((W/2 - R - B), 0.05) / 2.0
             top_half_z  = max((H/2 - R - B), 0.05) / 2.0
 
@@ -463,6 +463,7 @@ class VisionAviary(BaseRLAviary):
                     physicsClientId=CLIENT,
                 )
                 _track(ceiling)
+                _record_box([1.5, 1.5, float(self.z_max)], [5,5,0.02], [0.7,0.7,0.7,0.0])
             except Exception:
                 pass
 
@@ -470,30 +471,17 @@ class VisionAviary(BaseRLAviary):
         """Convert policy output to a PID target (with leash), and log diagnostics."""
         if self.ACT_TYPE == ActionType.PID:
             a = np.asarray(action, dtype=np.float32).reshape(self.NUM_DRONES, 3)
-<<<<<<< HEAD
-            raw_target = a[0]  # PPO’s absolute XYZ setpoint in meters
-            
-            pos  = self._getDroneStateVector(0)[0:3]
-            dist = float(np.linalg.norm(self.goal - pos))
-            
-            base = np.array([0.05, 0.05, 0.04], dtype=np.float32)   # was 0.05
-            boost = np.clip(0.10 * dist, 0.0, 0.10)                 # up to +0.10 m/step far away
-            max_step_xyz = base + boost
-            curr = self._getDroneStateVector(0)[0:3]
-            # move at most max_step toward the raw target
-=======
-            raw_target = a[0]  # policy's requested XYZ (your code already uses this convention)
+            raw_target = a[0]  # policy's requested XYZ
 
             # leash: small step toward raw_target, scaled by distance to goal
             pos  = self._getDroneStateVector(0)[0:3]
             dist = float(np.linalg.norm(self.goal - pos))
 
-            base  = np.array([0.07, 0.07, 0.06], dtype=np.float32)      # was ~0.05
-            boost = np.clip(0.12 * dist, 0.0, 0.12)                     # was 0.10 cap
+            base  = np.array([0.07, 0.07, 0.06], dtype=np.float32)
+            boost = np.clip(0.12 * dist, 0.0, 0.12)
             max_step_xyz = base + boost
 
             curr  = self._getDroneStateVector(0)[0:3]
->>>>>>> bf1eadb (changes 30/10)
             delta = np.clip(raw_target - pos, -max_step_xyz, +max_step_xyz)
             proposed = curr + delta
 
@@ -514,9 +502,8 @@ class VisionAviary(BaseRLAviary):
         # other action types unchanged
         return super()._preprocessAction(action)
     
-<<<<<<< HEAD
     def _clear_static(self):
-        for bid in self._obstacle_ids:
+        for bid in getattr(self, "_obstacle_ids", []):
             try: p.removeBody(bid, physicsClientId=self.CLIENT)
             except: pass
         self._obstacle_ids.clear()
@@ -524,59 +511,65 @@ class VisionAviary(BaseRLAviary):
             try: p.removeBody(self._goal_id, physicsClientId=self.CLIENT)
             except: pass
         self._goal_id = None
+        if hasattr(self, "_obstacle_specs"):
+            self._obstacle_specs.clear()
 
     def _spawn_goal_marker(self):
         # small bright cube as goal marker (easy to see)
-        self._goal_id = p.loadURDF("cube.urdf",
-                                    self.goal.tolist(),
-                                    p.getQuaternionFromEuler([0,0,0]),
-                                    useFixedBase=True, globalScaling=0.15,
-                                    physicsClientId=self.CLIENT)
-        # paint it green
         try:
-            p.changeVisualShape(self._goal_id, -1, rgbaColor=[0,1,0,1], physicsClientId=self.CLIENT)
-        except:
-            pass
+            if self._goal_id is not None:
+                try: p.removeBody(self._goal_id, physicsClientId=self.CLIENT)
+                except: pass
+            self._goal_id = p.loadURDF("cube.urdf",
+                                        self.goal.tolist(),
+                                        p.getQuaternionFromEuler([0,0,0]),
+                                        useFixedBase=True, globalScaling=0.15,
+                                        physicsClientId=self.CLIENT)
+            # paint it green
+            try:
+                p.changeVisualShape(self._goal_id, -1, rgbaColor=[0,1,0,1], physicsClientId=self.CLIENT)
+            except:
+                pass
+        except Exception:
+            self._goal_id = None
 
     def _add_obstacles_for_difficulty(self):
-    # remove previous
+        # backward-compatible simple obstacle builder used elsewhere
         for bid in getattr(self, "_obstacle_ids", []):
             try: p.removeBody(bid, physicsClientId=self.CLIENT)
             except: pass
         self._obstacle_ids = []
+        self._obstacle_specs = []
 
         def add_box(x,y,z, color=[0.8,0.2,0.2,1]):
             bid = p.loadURDF("cube.urdf", [x,y,z], useFixedBase=True, physicsClientId=self.CLIENT)
             try: p.changeVisualShape(bid, -1, rgbaColor=color, physicsClientId=self.CLIENT)
             except: pass
             self._obstacle_ids.append(bid)
+            # record an axis-aligned cube approx (half extents 0.15)
+            self._obstacle_specs.append({"type":"box","center":[x,y,z],"half":[0.15,0.15,0.15],"rgba":color})
 
-        d = self.difficulty
+        d = int(getattr(self, "difficulty", 0))
         if d == 0:
-        # open field = no obstacles
             return
         elif d == 1:
-        # single wall (row of cubes)
             for i in range(5):
                 add_box(x=1.0, y=0.5+0.3*i, z=0.25)
         elif d == 2:
-        # corridor with a gap
             for i in range(6):
                 add_box(x=1.0, y=-0.3+0.3*i, z=0.25)
                 if i != 3:
                     add_box(x=1.8, y=-0.3+0.3*i, z=0.25)
         elif d == 3:
-        # zig-zag obstacles
             for (x,y) in [(0.8,0.6),(1.4,1.0),(2.0,1.4)]:
                 add_box(x,y,0.25,color=[0.9,0.4,0.1,1])
         else:
-        # random clutter
             rng = np.random.default_rng()
             for _ in range(6):
                 x = float(rng.uniform(0.6, 2.4))
                 y = float(rng.uniform(0.4, 2.0))
                 add_box(x,y,0.25,color=[0.7,0.7,0.2,1])
-=======
+
     def export_current_level_to_obj(self, out_path: str, cyl_segments: int = 24):
         """
         Export all recorded primitives (boxes/cylinders) into one Wavefront OBJ.
@@ -609,21 +602,20 @@ class VisionAviary(BaseRLAviary):
         def add_cylinder(center, radius, height, rgba, nseg=cyl_segments):
             cx, cy, cz = center
             r = radius; h = height
-            z0 = cz - h/2.0; z1 = cz + h/2.0
             base = len(verts)
-            # ring vertices
-            for k in range(nseg):
-                th = 2*np.pi*k/nseg
-                x = cx
-                y = cy + r*np.cos(th)
-                z = cz + r*np.sin(th)  # cylinder axis along X (matches our PyBullet add_cylinder)
-                verts.append((x, y, z))
+            # ring vertices (cylinder axis along X)
             for k in range(nseg):
                 th = 2*np.pi*k/nseg
                 x = cx
                 y = cy + r*np.cos(th)
                 z = cz + r*np.sin(th)
-                verts.append((x + h, y, z))    # along +X
+                verts.append((x, y, z))
+            for k in range(nseg):
+                th = 2*np.pi*k/nseg
+                x = cx + h
+                y = cy + r*np.cos(th)
+                z = cz + r*np.sin(th)
+                verts.append((x, y, z))
             # side faces
             for k in range(nseg):
                 a  = base + k + 1
@@ -633,7 +625,7 @@ class VisionAviary(BaseRLAviary):
                 faces.append((a, b, b2)); colors.append(tuple(rgba[:3]))
                 faces.append((a, b2, a2)); colors.append(tuple(rgba[:3]))
 
-        # collect from recorded specs (these are filled in add_box/add_cylinder helpers)
+        # collect from recorded specs
         for s in specs:
             if s["type"] == "box":
                 add_box(s["center"], s["half"], s.get("rgba",[0.7,0.7,0.7,1]))
@@ -651,4 +643,3 @@ class VisionAviary(BaseRLAviary):
             for a,b,c in faces:
                 f.write(f"f {a} {b} {c}\n")
         print(f"[export] OBJ saved: {out_path}  (verts={len(verts)}, faces={len(faces)})")
->>>>>>> bf1eadb (changes 30/10)
