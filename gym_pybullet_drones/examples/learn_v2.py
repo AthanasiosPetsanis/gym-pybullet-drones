@@ -8,7 +8,7 @@ from datetime import datetime
 import argparse
 import numpy as np
 import os, numpy as np, matplotlib.pyplot as plt
-
+import gymnasium as gym
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
@@ -27,8 +27,23 @@ DEFAULT_OUTPUT_FOLDER = 'results'
 DEFAULT_OBS = ObservationType('kin')     # image obs
 DEFAULT_ACT = ActionType('pid')          # 3D setpoint -> PID -> RPMs
 DEFAULT_MA  = False
-DIFFICULTY = 0  # 0: easy, 1: medium, 2: hard
+DIFFICULTY = 2  # 0: easy, 1: medium, 2: hard
 
+class ActionRepeat(gym.Wrapper):
+    def __init__(self, env, k: int = 4):
+        super().__init__(env)
+        self.k = int(k)
+
+    def step(self, action):
+        total_r = 0.0
+        terminated = truncated = False
+        info = {}
+        for _ in range(self.k):
+            obs, r, terminated, truncated, info = self.env.step(action)
+            total_r += r
+            if terminated or truncated:
+                break
+        return obs, total_r, terminated, truncated, info
 def plot_evals(run_dir, show=True, save=True, title_suffix=""):
     import os, numpy as np, matplotlib.pyplot as plt
     evf = os.path.join(run_dir, "evaluations.npz")
@@ -81,21 +96,36 @@ def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_
 >>>>>>> 5a44e19 (12/9_changes)
 =======
         VisionAviary,
+<<<<<<< HEAD
         env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
                         random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2, 
                         start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True),
 >>>>>>> e7ec52b (changes_20/10)
         n_envs=1
+=======
+        env_kwargs=dict(
+            obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
+            random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2,
+            start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True,
+        ),
+        n_envs=1,
+        wrapper_class=ActionRepeat,          # <<< add this
+        wrapper_kwargs=dict(k=4),            # <<< and this (try k=4; later tune 3–5)
+>>>>>>> bf1eadb (changes 30/10)
     )
     train_env = VecFrameStack(train_env, n_stack=4, channels_order='first')
 
     # --- EVAL ENV ---
     eval_env = make_vec_env(
         VisionAviary,
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
-                        random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2, 
-                        start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True),
-        n_envs=1
+        env_kwargs=dict(
+            obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
+            random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2,
+            start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True,
+        ),
+        n_envs=1,
+        wrapper_class=ActionRepeat,          # <<< same wrapper for eval
+        wrapper_kwargs=dict(k=4),
     )
     eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='first')
 

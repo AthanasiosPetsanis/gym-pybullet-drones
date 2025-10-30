@@ -31,6 +31,7 @@ class VisionAviary(BaseRLAviary):
         self._obstacles_enabled = obstacles
         self._obstacle_ids = []      # track bodies we spawn
         self._goal_id = None
+<<<<<<< HEAD
         self.z_max = 1.4           # hard ceiling height (m)
         self.use_ceiling = True    # turn the invisible ceiling on/off
         self.success_thresh = 0.4     # meters
@@ -40,6 +41,32 @@ class VisionAviary(BaseRLAviary):
         self.dist_w         = 0.15          # constant pull toward the goal each step
         self.step_cost      = 0.02          # tiny time penalty per step
         self.success_bonus  = 300.0          # one-time bonus for reaching the goal
+=======
+
+        # spawn/goal controls
+        self.random_start = bool(random_start)
+        self.start_center_xy = tuple(start_center_xy)
+        self.start_radius = float(start_radius)
+        self.start_z_range = tuple(start_z_range)
+        self.keep_goal_z_equal_spawn = bool(keep_goal_z_equal_spawn)
+
+        # safety/room
+        self.ceiling_margin = float(ceiling_margin)
+        self.z_max = 1.4                # invisible ceiling baseline
+        self.use_ceiling = True
+
+        # reward
+        self.success_thresh = 0.4
+        self.progress_w = 15.0
+        self.dist_w = 0.15
+        self.step_cost = 0.02
+        self.success_bonus = 300.0
+        self._last_policy_action = None
+        self._last_pid_target = None
+
+        self._obstacle_specs = []
+        
+>>>>>>> bf1eadb (changes 30/10)
         super().__init__(
             drone_model=DroneModel.CF2X,
             num_drones=1,
@@ -164,20 +191,41 @@ class VisionAviary(BaseRLAviary):
         return self.step_counter >= 1300
 
     def _computeInfo(self):
-        """Also updates gate-pass counter for Level 3."""
-        pos = self._getDroneStateVector(0)[0:3]
+        pos  = self._getDroneStateVector(0)[0:3]
+        dist = float(np.linalg.norm(self.goal - pos))
 
-        # Level-3 gate pass-through (run every step, not during obstacle build)
+        # Level-3 gate pass-through (keep whatever you already have)
         if getattr(self, "_gates", None) and self.difficulty == 3 and self._gates_passed < len(self._gates):
             x_plane, y_center, z_hole, R_hole = self._gates[self._gates_passed]
-            near_plane = abs(float(pos[0] - x_plane)) <= 0.18       # close to wall plane in X
-            dy, dz = float(pos[1] - y_center), float(pos[2] - z_hole)
-            in_circle = (dy * dy + dz * dz) <= (R_hole - 0.05) ** 2 # inside the opening
+            near_plane = abs(float(pos[0] - x_plane)) <= 0.18
+            dy, dz = float(pos[1]-y_center), float(pos[2]-z_hole)
+            in_circle = (dy*dy + dz*dz) <= (R_hole - 0.05)**2
             if near_plane and in_circle:
                 self._gates_passed += 1
 
+<<<<<<< HEAD
         dist = float(np.linalg.norm(self.goal - pos))
         return {"distance_to_goal": dist, "is_success": dist < self.success_thresh}
+=======
+        info = {
+            "distance_to_goal": dist,
+            "is_success": dist < self.success_thresh,
+            "gates_passed": int(getattr(self, "_gates_passed", 0)),
+            "num_gates": int(len(getattr(self, "_gates", []))),
+            "pos": pos.copy(),
+        }
+        if getattr(self, "_last_pid_target", None) is not None:
+            info["pid_target"] = self._last_pid_target.copy()
+        if getattr(self, "_last_policy_action", None) is not None:
+            info["policy_action"] = self._last_policy_action.copy()
+        return info
+        
+
+    # ---------- Back-compat shim ----------
+    def _build_level_geometry(self, start, goal):
+        self.goal = np.array(goal, dtype=np.float32)
+        self._addObstacles()
+>>>>>>> bf1eadb (changes 30/10)
 
     # ---------- Helpers ----------
     def _getDroneImages(self, drone_id=0, segmentation=False):
@@ -422,6 +470,7 @@ class VisionAviary(BaseRLAviary):
         """Convert policy output to a PID target (with leash), and log diagnostics."""
         if self.ACT_TYPE == ActionType.PID:
             a = np.asarray(action, dtype=np.float32).reshape(self.NUM_DRONES, 3)
+<<<<<<< HEAD
             raw_target = a[0]  # PPO’s absolute XYZ setpoint in meters
             
             pos  = self._getDroneStateVector(0)[0:3]
@@ -432,6 +481,19 @@ class VisionAviary(BaseRLAviary):
             max_step_xyz = base + boost
             curr = self._getDroneStateVector(0)[0:3]
             # move at most max_step toward the raw target
+=======
+            raw_target = a[0]  # policy's requested XYZ (your code already uses this convention)
+
+            # leash: small step toward raw_target, scaled by distance to goal
+            pos  = self._getDroneStateVector(0)[0:3]
+            dist = float(np.linalg.norm(self.goal - pos))
+
+            base  = np.array([0.07, 0.07, 0.06], dtype=np.float32)      # was ~0.05
+            boost = np.clip(0.12 * dist, 0.0, 0.12)                     # was 0.10 cap
+            max_step_xyz = base + boost
+
+            curr  = self._getDroneStateVector(0)[0:3]
+>>>>>>> bf1eadb (changes 30/10)
             delta = np.clip(raw_target - pos, -max_step_xyz, +max_step_xyz)
             proposed = curr + delta
 
@@ -452,6 +514,7 @@ class VisionAviary(BaseRLAviary):
         # other action types unchanged
         return super()._preprocessAction(action)
     
+<<<<<<< HEAD
     def _clear_static(self):
         for bid in self._obstacle_ids:
             try: p.removeBody(bid, physicsClientId=self.CLIENT)
@@ -513,3 +576,79 @@ class VisionAviary(BaseRLAviary):
                 x = float(rng.uniform(0.6, 2.4))
                 y = float(rng.uniform(0.4, 2.0))
                 add_box(x,y,0.25,color=[0.7,0.7,0.2,1])
+=======
+    def export_current_level_to_obj(self, out_path: str, cyl_segments: int = 24):
+        """
+        Export all recorded primitives (boxes/cylinders) into one Wavefront OBJ.
+        Works with Blender's built-in 'Wavefront (.obj)' importer.
+        """
+        specs = getattr(self, "_obstacle_specs", [])
+        if not specs:
+            print("[export] nothing to export (build a level first)"); return
+
+        verts = []   # (x,y,z)
+        faces = []   # (i1,i2,i3) 1-based indices for OBJ
+        colors = []  # per-face RGB (we'll bake approximate color; Blender will import as a single object)
+
+        def add_box(center, half, rgba):
+            cx, cy, cz = center; hx, hy, hz = half
+            # 8 corners
+            v = [
+                (cx-hx, cy-hy, cz-hz),(cx+hx, cy-hy, cz-hz),(cx+hx, cy+hy, cz-hz),(cx-hx, cy+hy, cz-hz),
+                (cx-hx, cy-hy, cz+hz),(cx+hx, cy-hy, cz+hz),(cx+hx, cy+hy, cz+hz),(cx-hx, cy+hy, cz+hz),
+            ]
+            base = len(verts)
+            verts.extend(v)
+            # 12 triangles (two per face)
+            quads = [(0,1,2,3),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7)]
+            for q in quads:
+                faces.append((base+q[0]+1, base+q[1]+1, base+q[2]+1))
+                faces.append((base+q[0]+1, base+q[2]+1, base+q[3]+1))
+                colors.append(tuple(rgba[:3])); colors.append(tuple(rgba[:3]))
+
+        def add_cylinder(center, radius, height, rgba, nseg=cyl_segments):
+            cx, cy, cz = center
+            r = radius; h = height
+            z0 = cz - h/2.0; z1 = cz + h/2.0
+            base = len(verts)
+            # ring vertices
+            for k in range(nseg):
+                th = 2*np.pi*k/nseg
+                x = cx
+                y = cy + r*np.cos(th)
+                z = cz + r*np.sin(th)  # cylinder axis along X (matches our PyBullet add_cylinder)
+                verts.append((x, y, z))
+            for k in range(nseg):
+                th = 2*np.pi*k/nseg
+                x = cx
+                y = cy + r*np.cos(th)
+                z = cz + r*np.sin(th)
+                verts.append((x + h, y, z))    # along +X
+            # side faces
+            for k in range(nseg):
+                a  = base + k + 1
+                b  = base + ((k+1)%nseg) + 1
+                a2 = base + nseg + k + 1
+                b2 = base + nseg + ((k+1)%nseg) + 1
+                faces.append((a, b, b2)); colors.append(tuple(rgba[:3]))
+                faces.append((a, b2, a2)); colors.append(tuple(rgba[:3]))
+
+        # collect from recorded specs (these are filled in add_box/add_cylinder helpers)
+        for s in specs:
+            if s["type"] == "box":
+                add_box(s["center"], s["half"], s.get("rgba",[0.7,0.7,0.7,1]))
+            elif s["type"] == "cylinder":
+                add_cylinder(s["center"], s["radius"], s["height"], s.get("rgba",[0.85,0.35,0.35,1]))
+            else:
+                continue
+
+        # write OBJ (single object)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("# vision track export\n")
+            for vx,vy,vz in verts:
+                f.write(f"v {vx:.6f} {vy:.6f} {vz:.6f}\n")
+            # OBJ has no per-face color; we ignore colors here—set material in Blender
+            for a,b,c in faces:
+                f.write(f"f {a} {b} {c}\n")
+        print(f"[export] OBJ saved: {out_path}  (verts={len(verts)}, faces={len(faces)})")
+>>>>>>> bf1eadb (changes 30/10)

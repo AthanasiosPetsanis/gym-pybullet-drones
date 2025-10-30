@@ -120,7 +120,7 @@ def show(difficulty: int, seconds: float = 8.0, seed: int = 42, obs_mode="rgb"):
     # Let env finalize spawn/goal & obstacles
     env.reset(seed=seed)
     _ensure_goal(env)
-
+    
     client = env.CLIENT
     start = np.array(env.INIT_XYZS[0], dtype=np.float32)
     goal = np.array(env.goal, dtype=np.float32)
@@ -149,6 +149,7 @@ def show(difficulty: int, seconds: float = 8.0, seed: int = 42, obs_mode="rgb"):
 
     env.close()
 
+    env.export_current_level_to_obj("level_export.obj")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preview VisionAviary level geometry.")
