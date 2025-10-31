@@ -104,7 +104,38 @@ class VisionAviary(BaseRLAviary):
             self.observation_space = spaces.Box(
                 low=0, high=255, shape=(3, self.IMG_RES[1], self.IMG_RES[0]), dtype=np.uint8
             )
+    # ---- SAFE CLEANUP HELPERS ----
+    def _p_connected(self) -> bool:
+        try:
+            return bool(p.isConnected(self.CLIENT))
+        except Exception:
+            return False
 
+    def _safe_remove(self, bid):
+        if bid is None or not self._p_connected():
+            return
+        try:
+            p.getBodyInfo(bid, physicsClientId=self.CLIENT)  # raises if invalid
+        except Exception:
+            return
+        try:
+            p.removeBody(bid, physicsClientId=self.CLIENT)
+        except Exception:
+            pass
+
+    def _safe_clear_episode_bodies(self):
+        # clear obstacles
+        if getattr(self, "_obstacle_ids", None):
+            for bid in list(self._obstacle_ids):
+                self._safe_remove(bid)
+            self._obstacle_ids.clear()
+        # clear goal
+        if getattr(self, "_goal_id", None) is not None:
+            self._safe_remove(self._goal_id)
+            self._goal_id = None
+        # clear specs
+        if getattr(self, "_obstacle_specs", None) is not None:
+            self._obstacle_specs.clear()
     # ---------- RL API ----------
     def reset(self, seed=None, options=None):
         rng = np.random.default_rng()
@@ -182,13 +213,14 @@ class VisionAviary(BaseRLAviary):
         return False
 
     def _computeTruncated(self):
-        return self.step_counter >= 1300
+        # ~900 steps at 24 Hz ≈ 37.5 s — long enough for 5 m + detours
+        return self.step_counter >= 900
 
     def _computeInfo(self):
         pos  = self._getDroneStateVector(0)[0:3]
         dist = float(np.linalg.norm(self.goal - pos))
 
-        # Level-3 gate pass-through (keep whatever you already have)
+        # Level-3 gate pass-through
         if getattr(self, "_gates", None) and self.difficulty == 3 and self._gates_passed < len(self._gates):
             x_plane, y_center, z_hole, R_hole = self._gates[self._gates_passed]
             near_plane = abs(float(pos[0] - x_plane)) <= 0.18
@@ -255,6 +287,7 @@ class VisionAviary(BaseRLAviary):
         Safe during __init__: derives a default goal from spawn if needed.
         """
         CLIENT = self.CLIENT
+        self._safe_clear_episode_bodies()
 
         # ----- ensure bookkeeping
         if not hasattr(self, "_obstacle_ids"):
@@ -263,22 +296,6 @@ class VisionAviary(BaseRLAviary):
             self._goal_id = None
         if not hasattr(self, "_obstacle_specs"):
             self._obstacle_specs = []
-
-        # ----- cleanup previous
-        for bid in list(self._obstacle_ids):
-            try:
-                p.removeBody(bid, physicsClientId=CLIENT)
-            except Exception:
-                pass
-        self._obstacle_ids.clear()
-        self._obstacle_specs.clear()
-
-        if self._goal_id is not None:
-            try:
-                p.removeBody(self._goal_id, physicsClientId=CLIENT)
-            except Exception:
-                pass
-            self._goal_id = None
 
         # ----- derive start & goal safely
         if hasattr(self, "INIT_XYZS") and len(self.INIT_XYZS) > 0:
@@ -534,12 +551,9 @@ class VisionAviary(BaseRLAviary):
             self._goal_id = None
 
     def _add_obstacles_for_difficulty(self):
-        # backward-compatible simple obstacle builder used elsewhere
-        for bid in getattr(self, "_obstacle_ids", []):
-            try: p.removeBody(bid, physicsClientId=self.CLIENT)
-            except: pass
-        self._obstacle_ids = []
-        self._obstacle_specs = []
+        self._obstacle_ids = []        # bodies we will (re)spawn this episode
+        self._obstacle_specs = []      # used for export/preview
+        self._goal_id = None
 
         def add_box(x,y,z, color=[0.8,0.2,0.2,1]):
             bid = p.loadURDF("cube.urdf", [x,y,z], useFixedBase=True, physicsClientId=self.CLIENT)

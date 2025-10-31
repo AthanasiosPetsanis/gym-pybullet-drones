@@ -153,7 +153,7 @@ def show(difficulty: int, seconds: float = 8.0, seed: int = 42, obs_mode="rgb"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preview VisionAviary level geometry.")
-    parser.add_argument("--difficulty", type=int, default=3, help="1=no obstacles, 2=cylinder, 3=hoops")
+    parser.add_argument("--difficulty", type=int, default=2, help="1=no obstacles, 2=cylinder, 3=hoops")
     parser.add_argument("--seconds", type=float, default=8.0, help="How long to display the scene")
     parser.add_argument("--seed", type=int, default=42, help="Reset seed")
     parser.add_argument("--obs", type=str, default="rgb", choices=["rgb", "kin"], help="Observation preview mode")

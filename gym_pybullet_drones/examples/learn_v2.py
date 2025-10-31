@@ -1,226 +1,171 @@
-"""
-Minimal PPO + VisionAviary (image obs, PID actions) trainer/evaluator.
-Saves best_model.zip under results/save-<timestamp>/
-"""
-
-import os, time
+import os
 from datetime import datetime
 import argparse
-import numpy as np
-import os, numpy as np, matplotlib.pyplot as plt
+import torch
 import gymnasium as gym
-from stable_baselines3 import PPO, SAC
+
+from stable_baselines3 import PPO, SAC, DDPG
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecFrameStack
-from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
-from gym_pybullet_drones.envs.HoverAviary import HoverAviary
-from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 
-DEFAULT_GUI = True
-DEFAULT_RECORD_VIDEO = False
-DEFAULT_OUTPUT_FOLDER = 'results'
-DEFAULT_OBS = ObservationType('kin')     # image obs
-DEFAULT_ACT = ActionType('pid')          # 3D setpoint -> PID -> RPMs
-DEFAULT_MA  = False
-DIFFICULTY = 2  # 0: easy, 1: medium, 2: hard
 
+# ---------------- CLI ----------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--algo", type=str, default="ppo", choices=["ppo", "sac", "ddpg"])
+    p.add_argument("--steps", type=int, default=1_000_000)
+    p.add_argument("--gui", type=lambda s: s.lower() == "true", default=False)
+    p.add_argument("--difficulty", type=int, default=2)  # ← level 2: single cylinder
+    p.add_argument("--n-envs", type=int, default=8)      # parallel envs
+    p.add_argument("--repeat-k", type=int, default=3)    # action repeat (PID responsiveness vs speed)
+    p.add_argument("--eval-freq", type=int, default=100_000)
+    p.add_argument("--ckpt-freq", type=int, default=100_000)
+    p.add_argument("--eval-episodes", type=int, default=5)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+# --------- small wrapper: ActionRepeat ----------
 class ActionRepeat(gym.Wrapper):
-    def __init__(self, env, k: int = 4):
+    def __init__(self, env, k: int = 3):
         super().__init__(env)
         self.k = int(k)
 
     def step(self, action):
         total_r = 0.0
-        terminated = truncated = False
+        term = trunc = False
         info = {}
         for _ in range(self.k):
-            obs, r, terminated, truncated, info = self.env.step(action)
+            obs, r, term, trunc, info = self.env.step(action)
             total_r += r
-            if terminated or truncated:
+            if term or trunc:
                 break
-        return obs, total_r, terminated, truncated, info
-def plot_evals(run_dir, show=True, save=True, title_suffix=""):
-    import os, numpy as np, matplotlib.pyplot as plt
-    evf = os.path.join(run_dir, "evaluations.npz")
-    if not os.path.isfile(evf):
-        print("[WARN] No evaluations.npz found; nothing to plot."); return
-    E = np.load(evf)
-    t = E["timesteps"]
-    R = E["results"]      # (points, n_eval_eps)
-    L = E["ep_lengths"]   # (points, n_eval_eps)
-    r_mean, r_std = R.mean(axis=1), R.std(axis=1)
-    l_mean = L.mean(axis=1)
+        return obs, total_r, term, trunc, info
 
-    plt.figure()
-    plt.plot(t, r_mean); plt.fill_between(t, r_mean-r_std, r_mean+r_std, alpha=0.2)
-    plt.xlabel("timesteps"); plt.ylabel("eval mean reward (±std)")
-    plt.title(f"PPO (KIN) — reward vs timesteps{title_suffix}"); plt.grid(True)
-    if save: plt.savefig(os.path.join(run_dir, "eval_mean_reward.png"), dpi=150)
 
-    plt.figure()
-    plt.plot(t, l_mean)
-    plt.xlabel("timesteps"); plt.ylabel("eval mean episode length")
-    plt.title(f"PPO (KIN) — ep length vs timesteps{title_suffix}"); plt.grid(True)
-    if save: plt.savefig(os.path.join(run_dir, "eval_mean_ep_len.png"), dpi=150)
+def make_env_fn(difficulty, ctrl_hz=24, gui=False, repeat_k=3):
+    def _f():
+        env = VisionAviary(
+            gui=gui,
+            obs=ObservationType('kin'),     # KIN + PID (fast baseline)
+            act=ActionType('pid'),
+            ctrl_freq=ctrl_hz,
+            difficulty=difficulty,
+            random_start=True,
+            start_center_xy=(0.0, 0.0),
+            start_radius=1.2,
+            start_z_range=(0.75, 0.95),
+            keep_goal_z_equal_spawn=True,
+        )
+        env = ActionRepeat(env, k=repeat_k)
+        return env
+    return _f
 
-    if show: plt.show()
-    else: plt.close('all')
 
-def run(multiagent=DEFAULT_MA, output_folder=DEFAULT_OUTPUT_FOLDER, gui=DEFAULT_GUI,
-        plot=True, colab=False, record_video=DEFAULT_RECORD_VIDEO, local=True,
-        save_plots=True, eval_episodes=10, demo_seconds=8.0):
-    # ---- paths ----
-    run_dir = os.path.join(output_folder, 'save-'+datetime.now().strftime("%m.%d.%Y_%H.%M.%S"))
+def build_vec_env(n_envs, difficulty, gui, repeat_k, seed):
+    env_fns = [make_env_fn(difficulty, gui=False, repeat_k=repeat_k) for _ in range(n_envs)]
+    venv = SubprocVecEnv(env_fns, start_method="spawn")
+    venv.seed(seed)
+    return VecMonitor(venv)
+
+
+def main():
+    args = parse_args()
+    os.makedirs("results", exist_ok=True)
+    run_dir = os.path.join("results", "save-" + datetime.now().strftime("%m.%d.%Y_%H.%M.%S"))
     os.makedirs(run_dir, exist_ok=True)
 
-    # --- TRAIN ENV ---
-    train_env = make_vec_env(
-<<<<<<< HEAD
-<<<<<<< HEAD
-        HoverAviary,
-        env_kwargs=dict(
-            obs=DEFAULT_OBS,
-            act=DEFAULT_ACT,
-            ctrl_freq=24,
-            gui=True                 # if you want the PyBullet window
-            # render_mode="human"       # or "rgb_array" if you only need frames
+    print(f"[INFO] Training {args.algo.upper()} | diff={args.difficulty} | n_envs={args.n_envs} | k={args.repeat_k}")
+    print(f"[INFO] Logging to: {run_dir}")
+
+    # -------- Vec envs --------
+    train_env = build_vec_env(args.n_envs, args.difficulty, args.gui, args.repeat_k, args.seed)
+    eval_env = build_vec_env(1, args.difficulty, False, args.repeat_k, args.seed + 1)
+
+    # -------- Callbacks (quiet terminal, TB always on) --------
+    callbacks = [
+        CheckpointCallback(save_freq=args.ckpt_freq, save_path=run_dir, name_prefix="ckpt"),
+        EvalCallback(
+            eval_env,
+            best_model_save_path=run_dir,
+            log_path=run_dir,
+            eval_freq=args.eval_freq,
+            n_eval_episodes=args.eval_episodes,
+            deterministic=True,
+            verbose=0,
         ),
-=======
-        VisionAviary,
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY),
->>>>>>> 5a44e19 (12/9_changes)
-=======
-        VisionAviary,
-<<<<<<< HEAD
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
-                        random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2, 
-                        start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True),
->>>>>>> e7ec52b (changes_20/10)
-        n_envs=1
-=======
-        env_kwargs=dict(
-            obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
-            random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2,
-            start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True,
-        ),
-        n_envs=1,
-        wrapper_class=ActionRepeat,          # <<< add this
-        wrapper_kwargs=dict(k=4),            # <<< and this (try k=4; later tune 3–5)
->>>>>>> bf1eadb (changes 30/10)
-    )
-    train_env = VecFrameStack(train_env, n_stack=4, channels_order='first')
+    ]
 
-    # --- EVAL ENV ---
-    eval_env = make_vec_env(
-        VisionAviary,
-        env_kwargs=dict(
-            obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, difficulty=DIFFICULTY,
-            random_start=True, start_center_xy=(0.0, 0.0), start_radius=1.2,
-            start_z_range=(0.75, 0.95), keep_goal_z_equal_spawn=True,
-        ),
-        n_envs=1,
-        wrapper_class=ActionRepeat,          # <<< same wrapper for eval
-        wrapper_kwargs=dict(k=4),
-    )
-    eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='first')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # -------- Algorithms --------
+    if args.algo.lower() == "ppo":
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            device="cpu",
+            tensorboard_log=run_dir,  # TB always on
+            learning_rate=3e-4,
+            n_steps=512,              # with 8 envs → 4096 per rollout
+            batch_size=2048,          # big batches for speed/stability
+            n_epochs=10,
+            gamma=0.995,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            verbose=0,
+            policy_kwargs=dict(net_arch=[256, 256]),
+            seed=args.seed,
+        )
+    elif args.algo.lower() == "sac":
+        model = SAC(
+            policy="MlpPolicy",
+            env=train_env,
+            device=device,
+            tensorboard_log=run_dir,
+            learning_rate=2e-4,
+            buffer_size=200_000,
+            batch_size=256,
+            train_freq=1,
+            gradient_steps=1,
+            learning_starts=1_000,
+            ent_coef="auto",
+            tau=0.005,
+            verbose=0,
+            policy_kwargs=dict(net_arch=[256, 256]),
+            seed=args.seed,
+        )
+    elif args.algo.lower() == "ddpg":
+        model = DDPG(
+            policy="MlpPolicy",
+            env=train_env,
+            device=device,
+            tensorboard_log=run_dir,
+            learning_rate=1e-3,
+            buffer_size=200_000,
+            batch_size=256,
+            train_freq=1,
+            gradient_steps=1,
+            tau=0.005,
+            verbose=0,
+            policy_kwargs=dict(net_arch=[256, 256]),
+            seed=args.seed,
+        )
+    else:
+        raise ValueError(f"Unknown algo {args.algo}")
+
+    # -------- Learn --------
+    model.learn(total_timesteps=args.steps, callback=callbacks, progress_bar=False)
+    model.save(os.path.join(run_dir, "final_model.zip"))
+
+    print("[OK] Done. Saved to:", run_dir)
+    print("TensorBoard:", f"tensorboard --logdir {run_dir}")
 
 
-    #### Check the environment's spaces ########################
-    print('[INFO] Action space:', train_env.action_space)
-    print('[INFO] Observation space:', train_env.observation_space)
-
-    # ---- callbacks (define BEFORE learn) ----
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=run_dir + '/',
-        log_path=run_dir + '/',
-        eval_freq=10000,
-        n_eval_episodes=eval_episodes,
-        deterministic=True,
-        callback_on_new_best=None
-    )
-
-    # ---- model ----
-    
-    model = SAC(
-        "MlpPolicy", train_env,
-        device="cpu",
-        learning_rate=2e-4,       # modest LR
-        buffer_size=200_000,      # big enough, not huge
-        batch_size=256,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,             # 1 gradient step per env step
-        gradient_steps=1,         # keep it light/fast
-        learning_starts=1_000,    # start learning quickly
-        ent_coef="auto",          # automatic entropy tuning
-        target_update_interval=1,
-        policy_kwargs=dict(net_arch=[256, 256])  # small, fast MLP
-    )
-
-    # ---- train ----
-    try:
-        model.learn(total_timesteps=int(1e6), callback=eval_callback)
-    except KeyboardInterrupt:
-        model.save(run_dir + '/interrupt_model')
-        print('Saved:', run_dir + '/interrupt_model.zip')
-
-    # ---- final save ----
-    model.save(run_dir + '/final_model.zip')
-    print('Saved run to:', run_dir)
-
-    # ---- plots ----
-    plot_evals(run_dir, show=plot, save=save_plots, title_suffix=f" (diff={DIFFICULTY})")
-
-    if gui and demo_seconds > 0:
-        obs, _ = test_env.reset()
-        import time
-        start_demo = time.time()
-        while time.time() - start_demo < demo_seconds:
-            pos = test_env._getDroneStateVector(0)[0:3]
-            action = pos[None, :].astype(np.float32)  # PID setpoint (1,3)
-            obs, _, _, _, _ = test_env.step(action)
-            test_env.render()
-            sync(test_env.step_counter, start_demo, test_env.CTRL_TIMESTEP)
-    # ---- quick numeric summary ----
-    if os.path.isfile(run_dir + '/evaluations.npz'):
-        with np.load(run_dir + '/evaluations.npz') as data:
-            print('Last eval @', data['timesteps'][-1], 'steps, mean_reward =', data['results'].mean(axis=1)[-1])
-
-    # ---- visual eval (loads best_model.zip if present) ----
-    model_path = run_dir + '/best_model.zip' if os.path.isfile(run_dir + '/best_model.zip') else run_dir + '/final_model.zip'
-    AlgoClass = type(model)                 # reuse the class you just trained (PPO/SAC/DDPG/...)
-    model = AlgoClass.load(model_path, device="cpu")
-
-    test_env = VisionAviary(gui=gui, obs=DEFAULT_OBS, act=DEFAULT_ACT, ctrl_freq=24, record=record_video)
-    obs, info = test_env.reset(seed=42)
-    done = truncated = False
-    start = time.time()
-    ep_ret = 0.0
-    while not (done or truncated):
-        action, _ = model.predict(obs, deterministic=True)
-        obs, r, done, truncated, info = test_env.step(action)
-        ep_ret += r
-        test_env.render()
-        sync(test_env.step_counter, start, test_env.CTRL_TIMESTEP)
-    print('Episode return:', ep_ret)
-    test_env.close()
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--multiagent', default=DEFAULT_MA, type=str2bool)
-    parser.add_argument('--gui', default=DEFAULT_GUI, type=str2bool)
-    parser.add_argument('--record_video', default=DEFAULT_RECORD_VIDEO, type=str2bool)
-    parser.add_argument('--output_folder', default=DEFAULT_OUTPUT_FOLDER, type=str)
-    parser.add_argument('--colab', default=False, type=bool)
-    parser.add_argument('--plot', type=bool, default=True)          # show plots in a window
-    parser.add_argument('--save_plots', type=bool, default=True)    # also save PNGs
-    parser.add_argument('--eval_episodes', type=int, default=10)    # per evaluation
-    parser.add_argument('--demo_seconds', type=float, default=8.0)
-    ARGS = parser.parse_args()
-    run(**vars(ARGS))
+if __name__ == "__main__":
+    main()
