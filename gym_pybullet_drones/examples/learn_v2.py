@@ -3,11 +3,14 @@ from datetime import datetime
 import argparse
 import torch
 import gymnasium as gym
+import numpy as np
 
 from stable_baselines3 import PPO, SAC, DDPG
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
 
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
@@ -17,16 +20,17 @@ from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--algo", type=str, default="ppo", choices=["ppo", "sac", "ddpg"])
-    p.add_argument("--steps", type=int, default=1_000_000)
+    p.add_argument("--steps", type=int, default=1000000)
     p.add_argument("--gui", type=lambda s: s.lower() == "true", default=False)
-    p.add_argument("--difficulty", type=int, default=2)  # ← level 2: single cylinder
+    p.add_argument("--difficulty", type=int, default=1)  # ← levels: 1: no obstacles, 2: single cylinder, 3: room with obstacles
     p.add_argument("--n-envs", type=int, default=8)      # parallel envs
     p.add_argument("--repeat-k", type=int, default=3)    # action repeat (PID responsiveness vs speed)
-    p.add_argument("--eval-freq", type=int, default=100_000)
-    p.add_argument("--ckpt-freq", type=int, default=100_000)
+    p.add_argument("--eval-freq", type=int, default=20_000)
+    p.add_argument("--ckpt-freq", type=int, default=200_000)
     p.add_argument("--eval-episodes", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
+
 
 # --------- small wrapper: ActionRepeat ----------
 class ActionRepeat(gym.Wrapper):
@@ -45,28 +49,74 @@ class ActionRepeat(gym.Wrapper):
                 break
         return obs, total_r, term, trunc, info
 
+class DistanceCallback(BaseCallback):
+    """Γράφει στο TensorBoard τη μέση απόσταση από τον στόχο (env/distance_to_goal)."""
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dists = [info["distance_to_goal"] for info in infos if "distance_to_goal" in info]
+        if len(dists) > 0:
+            mean_dist = float(np.mean(dists))
+            # Θα εμφανιστεί στο tab SCALARS ως env/distance_to_goal
+            self.logger.record("env/distance_to_goal", mean_dist)
+        return True
+
+class TrajectoryCallback(BaseCallback):
+    """Αποθηκεύει (αραιά) την τροχιά μόνο του env 0 σε .npy."""
+    def __init__(self, save_dir: str, every_n_steps: int = 4, verbose: int = 0):
+        super().__init__(verbose)
+        self.save_dir = save_dir
+        self.every_n_steps = every_n_steps
+        self.buf = []
+        self.step_count = 0
+        self.ep_count = 0
+
+    def _on_training_start(self) -> None:
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        # μόνο env 0
+        if len(infos) > 0 and "pos" in infos[0]:
+            self.step_count += 1
+            if self.step_count % self.every_n_steps == 0:
+                self.buf.append(np.array(infos[0]["pos"], dtype=np.float32))
+
+        if len(dones) > 0 and dones[0]:
+            if len(self.buf) > 0:
+                out = np.stack(self.buf, axis=0)
+                np.save(os.path.join(self.save_dir, f"traj_env0_ep{self.ep_count}.npy"), out)
+                self.ep_count += 1
+            self.buf, self.step_count = [], 0
+        return True
+
 
 def make_env_fn(difficulty, ctrl_hz=24, gui=False, repeat_k=3):
     def _f():
         env = VisionAviary(
             gui=gui,
-            obs=ObservationType('kin'),     # KIN + PID (fast baseline)
+            obs=ObservationType('kin'),
             act=ActionType('pid'),
-            ctrl_freq=ctrl_hz,
+            ctrl_freq=ctrl_hz,              # <= Χρησιμοποιούμε το όρισμα
             difficulty=difficulty,
             random_start=True,
-            start_center_xy=(0.0, 0.0),
-            start_radius=1.2,
+            start_center_xy=(1.5, 0.0),
+            start_radius=1.0,
             start_z_range=(0.75, 0.95),
             keep_goal_z_equal_spawn=True,
         )
+        # Χρησιμοποίησε το repeat_k που περνάμε απ’ έξω
+        env = Monitor(env, info_keywords=("is_success", "distance_to_goal"))
         env = ActionRepeat(env, k=repeat_k)
         return env
     return _f
 
 
 def build_vec_env(n_envs, difficulty, gui, repeat_k, seed):
-    env_fns = [make_env_fn(difficulty, gui=False, repeat_k=repeat_k) for _ in range(n_envs)]
+    env_fns = [make_env_fn(difficulty, ctrl_hz=24, gui=False, repeat_k=repeat_k) for _ in range(n_envs)]
     venv = SubprocVecEnv(env_fns, start_method="spawn")
     venv.seed(seed)
     return VecMonitor(venv)
@@ -77,7 +127,8 @@ def main():
     os.makedirs("results", exist_ok=True)
     run_dir = os.path.join("results", "save-" + datetime.now().strftime("%m.%d.%Y_%H.%M.%S"))
     os.makedirs(run_dir, exist_ok=True)
-
+    traj_dir = os.path.join(run_dir, "trajs")
+    
     print(f"[INFO] Training {args.algo.upper()} | diff={args.difficulty} | n_envs={args.n_envs} | k={args.repeat_k}")
     print(f"[INFO] Logging to: {run_dir}")
 
@@ -97,6 +148,8 @@ def main():
             deterministic=True,
             verbose=0,
         ),
+        DistanceCallback(),
+        TrajectoryCallback(save_dir=traj_dir, every_n_steps=4),
     ]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -110,12 +163,12 @@ def main():
             tensorboard_log=run_dir,  # TB always on
             learning_rate=3e-4,
             n_steps=512,              # with 8 envs → 4096 per rollout
-            batch_size=2048,          # big batches for speed/stability
+            batch_size=1024,          # big batches for speed/stability
             n_epochs=10,
-            gamma=0.995,
+            gamma=0.98,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.0,
+            ent_coef=0.01,
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=0,

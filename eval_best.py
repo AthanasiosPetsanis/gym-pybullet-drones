@@ -6,6 +6,7 @@ from stable_baselines3 import PPO
 from gym_pybullet_drones.envs.VisionAviary import VisionAviary
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 from gym_pybullet_drones.utils.utils import sync
+from gym_pybullet_drones.examples.wrappers.decision_until_reach import DecisionUntilReach
 
 
 # ----------------------- utilities -----------------------
@@ -24,41 +25,30 @@ def pick_model(run_dir, prefer="final"):
     return best if os.path.isfile(best) else final
 
 def coerce_obs_single_env(obs: np.ndarray, policy_shape: tuple, buf: deque | None):
-    """
-    Coerce a single-env observation to exactly match the policy observation shape.
-    Handles three cases:
-      - exact match                 e.g., env (48,)         == policy (48,)
-      - batch/stack=1               e.g., env (48,)         -> policy (1, 48)
-      - frame stack=4               e.g., env (48,) x4      -> policy (4, 48)
-      - same logic for RGB          e.g., env (3,84,84)     -> (1,3,84,84) or (4,3,84,84)
-
-    If buf is provided (deque), it already contains the most recent frames.
-    """
+    """Coerce a single-env obs to the policy shape (handles stack=1 or 4, KIN or RGB)."""
     eshape = tuple(obs.shape)
     pshape = tuple(policy_shape)
 
-    # exact match
     if eshape == pshape:
         return obs
 
-    # need one leading axis (batch/stack=1)
+    # add a leading axis if the policy expects (1, ·)
     if len(pshape) == len(eshape) + 1 and pshape[0] == 1 and pshape[1:] == eshape:
         return np.expand_dims(obs, axis=0)
 
-    # need stack=4 along leading axis
+    # stack=4 along leading axis
     if len(pshape) == len(eshape) + 1 and pshape[0] == 4 and pshape[1:] == eshape:
-        assert buf is not None and len(buf) == 4, "internal: stack buffer not ready"
+        assert buf is not None and len(buf) == 4, "stack buffer not ready"
         return np.stack(list(buf), axis=0)
 
-    # fallback: try to broadcast with single leading axis
+    # last try: broadcast with single leading axis
     if len(pshape) == len(eshape) + 1 and pshape[1:] == eshape:
-        # assume stack=1
         return np.expand_dims(obs, axis=0)
 
     raise ValueError(f"Cannot coerce env obs shape {eshape} to policy shape {pshape}")
 
 def make_env(obs_kind: str, difficulty: int, gui: bool, record: bool):
-    return VisionAviary(
+    env = VisionAviary(
         obs=ObservationType(obs_kind),
         act=ActionType('pid'),
         ctrl_freq=24,
@@ -71,6 +61,9 @@ def make_env(obs_kind: str, difficulty: int, gui: bool, record: bool):
         start_z_range=(0.75, 0.95),
         keep_goal_z_equal_spawn=True,
     )
+    # <<< IMPORTANT: wrap BEFORE returning >>>
+    env = DecisionUntilReach(env, eps=0.25, hold=6, max_hold_steps=200)
+    return env
 
 def guess_obs_kind_from_shapes(policy_shape: tuple):
     # If last dims look like (3,H,W), assume RGB; else KIN
@@ -86,7 +79,6 @@ def run_episode(model, env, policy_shape: tuple, deterministic=True, realtime=Fa
     # prepare buffer if policy expects stack=4
     stack_len = 0
     if len(policy_shape) >= 2:
-        # if leading axis is 4, assume frame stack
         if policy_shape[0] == 4:
             stack_len = 4
         elif policy_shape[0] == 1:
@@ -95,7 +87,7 @@ def run_episode(model, env, policy_shape: tuple, deterministic=True, realtime=Fa
     buf = deque(maxlen=max(stack_len, 1))
 
     def squeeze_batch1(o):
-        # some envs return (1,·); drop that leading axis if present
+        # drop leading axis if env returns (1, ·)
         if isinstance(o, np.ndarray) and o.ndim >= 2 and o.shape[0] == 1 and len(policy_shape) == o.ndim - 1:
             return o.squeeze(0)
         return o
@@ -140,7 +132,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", type=str, default=None, help="results/save-* folder (default: newest)")
     ap.add_argument("--prefer",  type=str, default="final", choices=["best","final"], help="load best_model or final_model")
-    ap.add_argument("--difficulty", type=int, default=2, help="track level; 2 = cylinder")
+    ap.add_argument("--difficulty", type=int, default=1, help="track level; 2 = cylinder")
     ap.add_argument("--episodes", type=int, default=5)
     ap.add_argument("--stochastic", action="store_true")
     ap.add_argument("--gui", action="store_true")

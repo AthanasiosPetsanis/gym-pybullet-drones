@@ -1,6 +1,7 @@
 import numpy as np
 from gymnasium import spaces
 import pybullet as p
+from collections import deque
 
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics, ObservationType, ActionType
@@ -18,9 +19,9 @@ class VisionAviary(BaseRLAviary):
         difficulty: int = 0,
         initial_xyzs=None,
         initial_rpys=None,
-        random_start: bool = True,
+        random_start: bool = False,
         start_center_xy=(0.0, 0.0),
-        start_radius: float = 1.2,
+        start_radius: float = 0.3,
         start_z_range=(0.75, 0.95),
         keep_goal_z_equal_spawn: bool = True,
         ceiling_margin: float = 0.6,
@@ -35,20 +36,21 @@ class VisionAviary(BaseRLAviary):
         self._obstacle_specs = []    # record primitives for export
 
         # safety / ceiling
-        self.z_max = 1.4           # hard ceiling height (m)
+        self.z_max = 1.8           # hard ceiling height (m)
         self.use_ceiling = True    # turn the invisible ceiling on/off
+        self.episode_sec = 25.0
         self.ceiling_margin = float(ceiling_margin)
 
         # success / HOLD
-        self.success_thresh = 0.4     # meters
-        self.hold_steps_req = 10       # must stay inside for this many steps to count success
+        self.success_thresh = 0.1     # meters
+        self.hold_steps_req = 1       # must stay inside for this many steps to count success
         self._hold_count = 0
 
         # reward weights
-        self.progress_w     = 15.0          # weight for progress (prev_dist - dist)
-        self.dist_w         = 0.15          # constant pull toward the goal each step
-        self.step_cost      = 0.02          # tiny time penalty per step
-        self.success_bonus  = 300.0         # one-time bonus for reaching the goal
+        self.progress_w     = 20.0          # weight for progress (prev_dist - dist)
+        self.dist_w         = 0.05          # constant pull toward the goal each step
+        self.step_cost      = 0.01          # tiny time penalty per step
+        self.success_bonus  = 1500.0         # one-time bonus for reaching the goal
 
         # spawn/goal controls
         self.random_start = bool(random_start)
@@ -60,6 +62,26 @@ class VisionAviary(BaseRLAviary):
         # diagnostic / last action logging
         self._last_policy_action = None
         self._last_pid_target = None
+        self._stuck_hist = deque(maxlen=48)   # ~2s ιστορικό σε 24 Hz
+        self._last_pos_for_stuck = None
+        self.hold_new_actions_until_close = False
+        # ΜΕΙΩΝΟΥΜΕ το κατώφλι για να δέχεται πιο εύκολα νέο action (λιγότερο «κόλλημα» στο παλιό)
+        self.reach_eps = 0.1
+        self._held_action = None
+
+        #OOB params
+        self.oob_step_penalty   = 2.0    # μικρό per-step κόστος όταν είναι εκτός
+        self.oob_term_penalty   = 300.0  # επιπλέον κόστος τη στιγμή του OOB τερματισμού
+
+        # --- DEBUG SWITCHES ---
+        # 1) Απενεργοποίηση stuck truncation για να μην κόβονται πρόωρα επεισόδια κατά το debug
+        self.debug_no_stuck = False
+        # 2) «Καθαρό» τεστ PID: αγνοεί την policy και πάει κατευθείαν στο goal
+        self.force_pid_to_goal = False
+
+        # --- RAW action → setpoint mapping (world-frame Δx,Δy,Δz) ---
+        self.use_raw_action_mapping = True     # ενεργοποιεί το «καθαρό» mapping
+        self.raw_step_scale = np.array([0.3, 0.3, 0.22], dtype=np.float32)  # m/step (x,y,z)
 
         super().__init__(
             drone_model=DroneModel.CF2X,
@@ -101,9 +123,23 @@ class VisionAviary(BaseRLAviary):
 
         # observation space for RGB
         if self.OBS_TYPE == ObservationType.RGB:
+            # καθαρά οπτική παρατήρηση: 3 x H x W (uint8)
             self.observation_space = spaces.Box(
-                low=0, high=255, shape=(3, self.IMG_RES[1], self.IMG_RES[0]), dtype=np.uint8
+                low=0,
+                high=255,
+                shape=(3, self.IMG_RES[1], self.IMG_RES[0]),
+                dtype=np.uint8,
             )
+
+        if self.OBS_TYPE == ObservationType.KIN:
+            base_space = self.observation_space           # ό,τι όρισε το BaseRLAviary
+            base_dim = int(np.prod(base_space.shape))     # Flatten dimension
+            self._base_obs_dim = base_dim                 # για debug αν χρειαστεί
+
+            low = np.full((base_dim + 3,), -np.inf, dtype=np.float32)
+            high = np.full((base_dim + 3,), np.inf, dtype=np.float32)
+            self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
     # ---- SAFE CLEANUP HELPERS ----
     def _p_connected(self) -> bool:
         try:
@@ -154,13 +190,25 @@ class VisionAviary(BaseRLAviary):
             start = np.array(self.INIT_XYZS[0], dtype=np.float32)
 
         # Goal: 5 m in +X, keep Z equal to spawn if requested
-        goal_vec = np.array([5.0, 0.0, 0.0], dtype=np.float32)
+        goal_vec = np.array([2.0, 0.0, 0.0], dtype=np.float32)
         goal_xyz = start + goal_vec
         if self.keep_goal_z_equal_spawn:
             goal_xyz[2] = start[2]
 
         self.goal = goal_xyz.astype(np.float32)
         self.INIT_XYZS = start.reshape(1, 3)
+
+        # --- define a "room" bounding box to keep the agent in a corridor ---
+        # margins [m] around the straight line from spawn->goal
+        _x0 = float(start[0]); _y0 = float(start[1]); _z0 = float(start[2])
+        _xg = float(self.goal[0]); _yg = float(self.goal[1]); _zg = float(self.goal[2])
+        x_min = min(_x0, _xg) - 1.0
+        x_max = max(_x0, _xg) + 3.0
+        y_min = min(_y0, _yg) - 2.0
+        y_max = max(_y0, _yg) + 2.0
+        z_min = 0.45
+        z_max = float(getattr(self, "z_max", 1.8))
+        self._room_bbox = (x_min, x_max, y_min, y_max, z_min, z_max)
 
         # ceiling safety margin
         if getattr(self, "use_ceiling", True):
@@ -173,48 +221,139 @@ class VisionAviary(BaseRLAviary):
         return obs, info
 
     def _computeObs(self):
+        """
+        Παρατήρηση:
+        - KIN: [flattened base_obs, goal - pos]  → 1D vector
+        - RGB: εικόνα κάμερας (3, H, W)
+        """
         if self.OBS_TYPE == ObservationType.KIN:
-            return super()._computeObs()
+            base_obs = super()._computeObs()
+            base_obs = np.asarray(base_obs, dtype=np.float32).reshape(-1)  # flatten
+
+            pos = self._getDroneStateVector(0)[0:3]
+            goal_vec = (self.goal - pos).astype(np.float32)                # (3,)
+
+            obs = np.concatenate([base_obs, goal_vec], axis=0)
+            return obs
+
+        # RGB case
         img, _, _ = self._getDroneImages(0)
         return img
 
     def _computeReward(self):
-        pos = self._getDroneStateVector(0)[0:3]
-        dist = float(np.linalg.norm(self.goal - pos))
+        s   = self._getDroneStateVector(0)
+        pos = s[0:3]
 
-        progress = 0.0 if self._last_distance is None else (self._last_distance - dist)
+        dist = float(np.linalg.norm(self.goal - pos))
+        if self._last_distance is None:
+            progress = 0.0
+        else:
+            progress = self._last_distance - dist
         self._last_distance = dist
 
-        reward = self.progress_w * progress
-        reward += -self.dist_w * dist
-        reward += -self.step_cost
+        reward  = 60.0 * progress            # δυνατό σήμα κατεύθυνσης
+        reward += -0.04 * dist               # σταθερή έλξη
+        reward += -0.003                     # μικρό step cost
+
+        # σκαλοπάτια κοντά στο goal (πυκνώνουμε «καρότο» πριν το success)
+        if dist < 1.5:  reward += 10.0
+        if dist < 1.0:  reward += 35.0
+        if dist < 0.8:  reward += 60.0
+        if dist < 0.6:  reward += 90.0
 
         if dist < self.success_thresh:
-            reward += self.success_bonus
-
-        if dist < 0.8:
-            reward += -0.5 * abs(pos[2] - self.goal[2])
+            reward += 150.0                  # +20 σε σχέση με πριν, για καλύτερο σήμα
 
         if self._isCollision(0):
-            reward -= 100.0
+            reward -= 300.0
+
+        # --- OOB penalties ---
+        if self._is_oob(pos):
+            reward -= self.oob_step_penalty
+            # αν πρόκειται να τερματίσει τώρα ως OOB, ρίξε και επιπλέον terminal κόστος
+            if getattr(self, "_term_reason", "") == "oob":
+                reward -= self.oob_term_penalty
+
+        vel = s[10:13]                         # γραμμική ταχύτητα από state
+        gv  = (self.goal - pos)
+        if np.linalg.norm(vel) > 1e-6 and np.linalg.norm(gv) > 1e-6:
+            cos_align = float(np.dot(vel, gv) / (np.linalg.norm(vel)*np.linalg.norm(gv)))
+        else:
+            cos_align = 0.0
+        reward += 0.5 * cos_align              # μικρό βάρος, ρυθμίσιμο
+
+        # terminal success bonus (προσδοκώμενο hold στο ίδιο βήμα)
+        prospective_hold = self._hold_count + 1 if dist < self.success_thresh else 0
+        if prospective_hold >= self.hold_steps_req:
+            reward += self.success_bonus
 
         return reward
 
+
     def _computeTerminated(self):
-        pos = self._getDroneStateVector(0)[0:3]
+        pos  = self._getDroneStateVector(0)[0:3]
         dist = float(np.linalg.norm(self.goal - pos))
+
+        # gates (level 3)
         all_gates_ok = True
         if getattr(self, "_gates", None) and self.difficulty == 3:
             all_gates_ok = (self._gates_passed >= len(self._gates))
+
+        # hold-in-goal λογική
         if dist < self.success_thresh and all_gates_ok:
+            self._hold_count = getattr(self, "_hold_count", 0) + 1
+        else:
+            self._hold_count = 0
+
+        # επιτυχία
+        if self._hold_count >= self.hold_steps_req:
+            self._term_reason = "success"
             return True
-        if self._isCollision(0):
+
+        # OOB: αυστηρό κόψιμο όταν βγει εκτός «room»
+        pos = self._getDroneStateVector(0)[0:3]
+        if self._is_oob(pos):
+            self._term_reason = "oob"
             return True
+
+        # ΜΗΝ τερματίζεις για σύγκρουση τα πρώτα ~60 βήματα (≈2.5s @24Hz)
+        collided = bool(self._isCollision(0))
+        if self.step_counter > 60 and collided:
+            self._term_reason = "collision"
+            return True
+
+        self._term_reason = ""
         return False
 
+
     def _computeTruncated(self):
-        # ~900 steps at 24 Hz ≈ 37.5 s — long enough for 5 m + detours
-        return self.step_counter >= 900
+        # Με το debug_no_stuck δεν κάνουμε stuck-truncation,
+        # κρατάμε ΜΟΝΟ ένα μεγάλο time limit για ασφάλεια.
+        if getattr(self, "debug_no_stuck", False):
+            pyb = getattr(self, "pyb_freq", getattr(self, "PYB_FREQ", 240))
+            ctrl = getattr(self, "ctrl_freq", getattr(self, "CTRL_FREQ", 24))
+            time_limit = (self.step_counter >= 900 * (pyb / ctrl))  # ~9000 βήματα @24Hz
+            return bool(time_limit)
+
+        # (παλιό logic)
+        pyb = getattr(self, "pyb_freq", getattr(self, "PYB_FREQ", 240))
+        ctrl = getattr(self, "ctrl_freq", getattr(self, "CTRL_FREQ", 24))
+
+        # OOB hard truncation (keeps eval stable and avoids 35m "escapes")
+        pos = self._getDroneStateVector(0)[0:3]
+        if self._is_oob(pos):
+            self._term_reason = "oob"
+            return True
+        # stuck detection
+        pos  = self._getDroneStateVector(0)[0:3]
+        dist = float(np.linalg.norm(self.goal - pos))
+        self._stuck_hist.append(dist)
+        stuck = (len(self._stuck_hist) == self._stuck_hist.maxlen and
+                (np.max(self._stuck_hist) - np.min(self._stuck_hist) < 0.08))
+
+        time_limit = (self.step_counter >= 900 * (pyb / ctrl))
+        return bool(stuck or time_limit)
+
 
     def _computeInfo(self):
         pos  = self._getDroneStateVector(0)[0:3]
@@ -231,17 +370,33 @@ class VisionAviary(BaseRLAviary):
 
         info = {
             "distance_to_goal": dist,
-            "is_success": dist < self.success_thresh,
+            "is_success": bool(self._hold_count >= self.hold_steps_req),
             "gates_passed": int(getattr(self, "_gates_passed", 0)),
             "num_gates": int(len(getattr(self, "_gates", []))),
             "pos": pos.copy(),
+            "hold_count": int(getattr(self, "_hold_count", 0)),
+            "collision": bool(self._isCollision(0)),
+            "term_reason": getattr(self, "_term_reason", ""),
         }
         if getattr(self, "_last_pid_target", None) is not None:
             info["pid_target"] = self._last_pid_target.copy()
         if getattr(self, "_last_policy_action", None) is not None:
             info["policy_action"] = self._last_policy_action.copy()
+        if getattr(self, "_held_action", None) is not None:
+            info["held_action"] = self._held_action.copy()
+        # Lightweight console debug κάθε ~1s @24Hz
+        try:
+            if (self.step_counter % 24) == 0:
+                _held  = getattr(self, "_held_action", None)
+                _sp    = getattr(self, "_last_pid_target", None)
+                print(f"[t={self.step_counter:04d}] dist={dist:.2f}  pos={pos}  "
+                    f"held={_held if _held is not None else 'None'}  "
+                    f"sp={_sp if _sp is not None else 'None'}  "
+                    f"term={getattr(self,'_term_reason','')}")
+        except Exception:
+            pass    
         return info
-        
+
 
     # ---------- Back-compat shim ----------
     def _build_level_geometry(self, start, goal):
@@ -273,6 +428,14 @@ class VisionAviary(BaseRLAviary):
         rgb = np.reshape(rgba, (h, w, 4))[:, :, :3]
         rgb = np.transpose(rgb, (2, 0, 1)).astype(np.uint8)
         return rgb, None, None
+    
+    def _is_oob(self, pos):
+        if not hasattr(self, "_room_bbox"):
+            return False
+        x_min, x_max, y_min, y_max, z_min, z_max = self._room_bbox
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        return (x < x_min) or (x > x_max) or (y < y_min) or (y > y_max) or (z < z_min) or (z > z_max)
+
 
     def _isCollision(self, drone_id=0):
         cps = p.getContactPoints(bodyA=self.DRONE_IDS[drone_id], physicsClientId=self.CLIENT)
@@ -485,104 +648,51 @@ class VisionAviary(BaseRLAviary):
                 pass
 
     def _preprocessAction(self, action):
-        """Convert policy output to a PID target (with leash), and log diagnostics."""
-        if self.ACT_TYPE == ActionType.PID:
-            a = np.asarray(action, dtype=np.float32).reshape(self.NUM_DRONES, 3)
-            raw_target = a[0]  # policy's requested XYZ
+        if self.ACT_TYPE != ActionType.PID:
+            return super()._preprocessAction(action)
 
-            # leash: small step toward raw_target, scaled by distance to goal
-            pos  = self._getDroneStateVector(0)[0:3]
-            dist = float(np.linalg.norm(self.goal - pos))
+        # --- RAW mapping: PPO action -> Δx,Δy,Δz (world frame) ---
+        a = np.asarray(action, dtype=np.float32).reshape(self.NUM_DRONES, 3)[0]
+        a = np.clip(a, -1.0, 1.0)
+        self._last_policy_action = a.copy()  # log
 
-            base  = np.array([0.07, 0.07, 0.06], dtype=np.float32)
-            boost = np.clip(0.12 * dist, 0.0, 0.12)
-            max_step_xyz = base + boost
+        pos = self._getDroneStateVector(0)[0:3]
 
-            curr  = self._getDroneStateVector(0)[0:3]
-            delta = np.clip(raw_target - pos, -max_step_xyz, +max_step_xyz)
-            proposed = curr + delta
+        # κλιμάκωση του ωμού action σε μέτρα ανά control step
+        scale = getattr(self, "raw_step_scale", np.array([0.45, 0.45, 0.30], dtype=np.float32))
+        step = scale * a
 
-            if not hasattr(self, "_ema_target"):
-                self._ema_target = curr.copy()
-            alpha = 0.35
-            self._ema_target = (1.0 - alpha) * self._ema_target + alpha * proposed
-            smoothed = self._ema_target
-            # ---- diagnostics for plotting (what NN asked vs what PID will chase)
-            self._last_policy_action = raw_target.copy()
-            self._last_pid_target    = smoothed.copy()
+        # clamp βήματος για ασφάλεια (προαιρετικό σφίξιμο)
+        step[0] = np.clip(step[0], -0.60, 0.60)
+        step[1] = np.clip(step[1], -0.60, 0.60)
+        step[2] = np.clip(step[2], -0.30, 0.30)
 
-            # send to BaseAviary PID path
-            out = np.zeros((self.NUM_DRONES, 3), dtype=np.float32)
-            out[0] = smoothed
-            return super()._preprocessAction(out)
+        sp_raw = pos + step
 
-        # other action types unchanged
-        return super()._preprocessAction(action)
-    
-    def _clear_static(self):
-        for bid in getattr(self, "_obstacle_ids", []):
-            try: p.removeBody(bid, physicsClientId=self.CLIENT)
-            except: pass
-        self._obstacle_ids.clear()
-        if self._goal_id is not None:
-            try: p.removeBody(self._goal_id, physicsClientId=self.CLIENT)
-            except: pass
-        self._goal_id = None
-        if hasattr(self, "_obstacle_specs"):
-            self._obstacle_specs.clear()
+        # όριο ύψους (ασφάλεια)
+        z_lo = 0.5
+        z_hi = float(getattr(self, "z_max", 1.8)) - 0.10
+        sp_raw[2] = np.clip(sp_raw[2], z_lo, z_hi)
 
-    def _spawn_goal_marker(self):
-        # small bright cube as goal marker (easy to see)
-        try:
-            if self._goal_id is not None:
-                try: p.removeBody(self._goal_id, physicsClientId=self.CLIENT)
-                except: pass
-            self._goal_id = p.loadURDF("cube.urdf",
-                                        self.goal.tolist(),
-                                        p.getQuaternionFromEuler([0,0,0]),
-                                        useFixedBase=True, globalScaling=0.15,
-                                        physicsClientId=self.CLIENT)
-            # paint it green
-            try:
-                p.changeVisualShape(self._goal_id, -1, rgbaColor=[0,1,0,1], physicsClientId=self.CLIENT)
-            except:
-                pass
-        except Exception:
-            self._goal_id = None
-
-    def _add_obstacles_for_difficulty(self):
-        self._obstacle_ids = []        # bodies we will (re)spawn this episode
-        self._obstacle_specs = []      # used for export/preview
-        self._goal_id = None
-
-        def add_box(x,y,z, color=[0.8,0.2,0.2,1]):
-            bid = p.loadURDF("cube.urdf", [x,y,z], useFixedBase=True, physicsClientId=self.CLIENT)
-            try: p.changeVisualShape(bid, -1, rgbaColor=color, physicsClientId=self.CLIENT)
-            except: pass
-            self._obstacle_ids.append(bid)
-            # record an axis-aligned cube approx (half extents 0.15)
-            self._obstacle_specs.append({"type":"box","center":[x,y,z],"half":[0.15,0.15,0.15],"rgba":color})
-
-        d = int(getattr(self, "difficulty", 0))
-        if d == 0:
-            return
-        elif d == 1:
-            for i in range(5):
-                add_box(x=1.0, y=0.5+0.3*i, z=0.25)
-        elif d == 2:
-            for i in range(6):
-                add_box(x=1.0, y=-0.3+0.3*i, z=0.25)
-                if i != 3:
-                    add_box(x=1.8, y=-0.3+0.3*i, z=0.25)
-        elif d == 3:
-            for (x,y) in [(0.8,0.6),(1.4,1.0),(2.0,1.4)]:
-                add_box(x,y,0.25,color=[0.9,0.4,0.1,1])
+        # προαιρετικό «hold μέχρι κοντά» (αν είναι ενεργό στο __init__)
+        if getattr(self, "hold_new_actions_until_close", False):
+            if getattr(self, "_held_action", None) is None:
+                self._held_action = sp_raw.copy()
+            else:
+                if float(np.linalg.norm(pos - self._held_action)) >= float(self.reach_eps):
+                    sp_raw = self._held_action.copy()
+                else:
+                    self._held_action = sp_raw.copy()
         else:
-            rng = np.random.default_rng()
-            for _ in range(6):
-                x = float(rng.uniform(0.6, 2.4))
-                y = float(rng.uniform(0.4, 2.0))
-                add_box(x,y,0.25,color=[0.7,0.7,0.2,1])
+            self._held_action = sp_raw.copy()
+
+        sp = sp_raw.astype(np.float32)
+        self._last_pid_target = sp.copy()
+
+        # το BaseRLAviary περιμένει στόχο ανά drone (NUM_DRONES,3)
+        out = np.zeros((self.NUM_DRONES, 3), dtype=np.float32)
+        out[0] = sp
+        return super()._preprocessAction(out)
 
     def export_current_level_to_obj(self, out_path: str, cyl_segments: int = 24):
         """
